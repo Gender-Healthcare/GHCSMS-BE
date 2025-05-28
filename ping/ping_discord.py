@@ -3,8 +3,11 @@ from dotenv import load_dotenv
 import discord
 import asyncio
 from discord.ext import commands
+import logging
 
 load_dotenv()
+
+logging.getLogger('discord.gateway').setLevel(logging.INFO)
 
 intents = discord.Intents.default()
 intents.message_content = True
