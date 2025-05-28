@@ -2,6 +2,7 @@ import ollama
 import redis
 import json
 import os
+import re
 from pymongo import MongoClient
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -22,19 +23,25 @@ FILE_ID = os.getenv('GOOGLE_DRIVE_FILE_ID')
 MONGO_URI = os.getenv('MONGO_URI')
 MONGO_DB = os.getenv('MONGO_DB', 'angler')
 MONGO_COLL = os.getenv('MONGO_COLLECTION', 'Vector')
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')  # Added default
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))  # Default to 6379
-REDIS_PASS = os.getenv('REDIS_PASSWORD', '')  # Default to empty string
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+REDIS_PASS = os.getenv('REDIS_PASSWORD', '')
 DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 DISCORD_CHANNEL = int(os.getenv('DISCORD_CHANNEL_ID', 0))
-# Updated to use a model that produces 768-dimensional embeddings
-MODEL = os.getenv('LANGUAGE_MODEL')  # This model produces 768-dim embeddings
+MODEL = os.getenv('EMBEDDING_MODEL', 'nomic-embed-text')  # Ensures 768D embeddings
+LANGUAGE_MODEL = os.getenv('LANGUAGE_MODEL', 'mistral')  # Default for chat
+DOCUMENT_READY = False
+
+# Set Ollama host
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', '127.0.0.1:11434')
+os.environ['OLLAMA_HOST'] = OLLAMA_HOST
+print(f"Using Ollama host: {OLLAMA_HOST}")
 
 # Validate environment variables
 if not all([GOOGLE_CREDS, FILE_ID, MONGO_URI, MONGO_DB, DISCORD_TOKEN, DISCORD_CHANNEL, REDIS_HOST]):
-    raise ValueError("Missing required environment variables: GOOGLE_DRIVE_CREDENTIALS_FILE, GOOGLE_DRIVE_FILE_ID, MONGO_URI, MONGO_DB, DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, or REDIS_HOST")
+    raise ValueError("Missing required environment variables")
 
-# 1. Enhanced Google Drive download with file type detection
+# 1. Google Drive download
 def download_from_drive(file_id):
     try:
         creds = service_account.Credentials.from_service_account_file(
@@ -71,10 +78,10 @@ def download_from_drive(file_id):
             print(f"Unsupported file type: {mime_type}")
             return None
     except Exception as e:
-        print(f"Error downloading file from Google Drive: {e}")
+        print(f"Error downloading file: {e}")
         return None
 
-# 2. PDF text extraction using PyMuPDF
+# 1.2. PDF text extraction
 def extract_text_from_pdf(pdf_bytes):
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -86,115 +93,144 @@ def extract_text_from_pdf(pdf_bytes):
         doc.close()
         return text
     except Exception as e:
-        print(f"Error extracting text from PDF with PyMuPDF: {e}")
+        print(f"Error extracting PDF text: {e}")
         return None
 
-# 3. Enhanced text splitting with better chunk handling
-def split_text(text, chunk_size=1000, overlap=200):
-    if not text:
-        return []
-    
-    text = text.strip()
-    text = ' '.join(text.split())
-    
-    if len(text) <= chunk_size:
-        return [text]
-    
-    chunks = []
-    start = 0
-    
-    while start < len(text):
-        end = start + chunk_size
-        if end >= len(text):
-            chunks.append(text[start:])
-            break
-        break_point = text.rfind('.', start, end)
-        if break_point == -1:
-            break_point = text.rfind(' ', start, end)
-        if break_point == -1:
-            break_point = end
-        chunks.append(text[start:break_point + 1].strip())
-        start = break_point + 1 - overlap
-        if start < 0:
-            start = 0
-    
-    return [chunk for chunk in chunks if chunk]
+# 1.3. Text splitting
+def recursive_split(text, chunk_size=1000, overlap=200, splitters=["\n\n", "\n", ".", " ", ""]):
+    def split_with_delimiter(text, delimiter):
+        return text.split(delimiter) if delimiter else list(text)
 
-# 4. Generate embeddings with better error handling - Updated for 768 dimensions
+    def recurse(chunks, splitter_idx):
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= chunk_size:
+                final_chunks.append(chunk.strip())
+            elif splitter_idx < len(splitters):
+                pieces = split_with_delimiter(chunk, splitters[splitter_idx])
+                temp = ""
+                for piece in pieces:
+                    if len(temp) + len(piece) + len(splitters[splitter_idx]) <= chunk_size:
+                        temp += piece + (splitters[splitter_idx] if splitter_idx != len(splitters) - 1 else '')
+                    else:
+                        final_chunks.append(temp.strip())
+                        temp = piece + (splitters[splitter_idx] if splitter_idx != len(splitters) - 1 else '')
+                if temp:
+                    final_chunks.append(temp.strip())
+                final_chunks = recurse(final_chunks, splitter_idx + 1)
+            else:
+                final_chunks.append(chunk.strip())
+        return final_chunks
+
+    initial_chunks = [text.strip()]
+    chunks = recurse(initial_chunks, 0)
+
+    overlapped_chunks = []
+    for i in range(0, len(chunks)):
+        start = max(0, i - 1)
+        context = " ".join(chunks[start:i + 1])
+        overlapped_chunks.append(context)
+
+    return overlapped_chunks
+
+# 1.4. Generate embeddings
 def get_embedding(text):
     try:
         text = text.strip()
         if not text:
             return None
+        print(f"Generating embedding with model: {MODEL}")
         response = ollama.embeddings(model=MODEL, prompt=text)
         embedding = response.get('embedding') or response.get('embeddings')
         if not embedding:
             raise ValueError(f"Model '{MODEL}' returned no embedding data")
-        # Updated to expect 768 dimensions for the 'default' index
         if len(embedding) != 768:
             raise ValueError(f"Embedding dimension mismatch: expected 768, got {len(embedding)}")
         return embedding
     except Exception as e:
-        print(f"Error generating embedding with {MODEL}: {e}")
+        print(f"Error generating embedding: {e}")
         return None
 
-# 5. Store to MongoDB with better error handling
+# 1.5. Store to MongoDB
 def store_to_mongo(embeddings_chunks, collection_name=MONGO_COLL):
     try:
         client = MongoClient(MONGO_URI)
         db = client[MONGO_DB]
         collection = db[collection_name]
-        collection.delete_many({})  # Clear existing data
+        collection.delete_many({})
         successful_inserts = 0
         for chunk, vector in embeddings_chunks:
             if vector and chunk.strip():
                 collection.insert_one({"text": chunk, "embedding": vector})
                 successful_inserts += 1
         client.close()
-        print(f"Successfully stored {successful_inserts} documents to MongoDB")
+        print(f"Stored {successful_inserts} documents to MongoDB")
     except Exception as e:
         print(f"Error storing to MongoDB: {e}")
     finally:
         if 'client' in locals():
             client.close()
 
-# 6. Check if search index exists - Updated to use 'default' index name
+# 1.6. Initialize document
+async def initialize_document():
+    global DOCUMENT_READY
+    if DOCUMENT_READY:
+        return
+
+    print("Initializing document...")
+
+    text = download_from_drive(FILE_ID)
+    if not text:
+        print("Failed to download/extract document.")
+        return
+
+    print(f"Extracted {len(text)} characters")
+
+    chunks = recursive_split(text)
+    embeddings_chunks = []
+    for i, chunk in enumerate(chunks):
+        embedding = get_embedding(chunk)
+        if embedding:
+            embeddings_chunks.append((chunk, embedding))
+        if i + 1 == len(chunks) or (i + 1) % 10 == 0:
+            print(f"Processed {i + 1}/{len(chunks)} chunks")
+
+    print(f"Generated {len(embeddings_chunks)} embeddings")
+    store_to_mongo(embeddings_chunks)
+    DOCUMENT_READY = True
+
+# 6. Check search index
 def check_search_index(collection_name=MONGO_COLL, index_name='default'):
     try:
         client = MongoClient(MONGO_URI)
         db = client[MONGO_DB]
         collection = db[collection_name]
         
-        # Check vector search indexes using $listSearchIndexes
-        try:
-            search_indexes = list(collection.aggregate([{"$listSearchIndexes": {}}]))
-            for index in search_indexes:
-                if index['name'] == index_name and index['type'] == 'vectorSearch':
-                    client.close()
-                    return True
-        except Exception as e:
-            print(f"Error checking vector search indexes: {e}")
+        search_indexes = list(collection.aggregate([{"$listSearchIndexes": {}}]))
+        for index in search_indexes:
+            if index['name'] == index_name and index['type'] == 'vectorSearch':
+                client.close()
+                return True
         
         client.close()
-        print(f"Vector search index '{index_name}' not found in collection '{collection_name}'.")
+        print(f"Vector search index '{index_name}' not found.")
         return False
     except Exception as e:
         print(f"Error checking index: {e}")
         return False
 
-# 7. Search MongoDB - Updated to use $vectorSearch syntax
+# 7. Search MongoDB
 def search_mongo(query_embedding, collection_name=MONGO_COLL, index_name='default', field_name='embedding', limit=3):
     if not query_embedding:
         return []
     if not check_search_index(collection_name, index_name):
-        print(f"Vector search index '{index_name}' not found or not properly configured. Please create it in MongoDB Atlas.")
+        print(f"Vector search index '{index_name}' not configured.")
         return []
     try:
         client = MongoClient(MONGO_URI)
         db = client[MONGO_DB]
         collection = db[collection_name]
         
-        # Updated pipeline for vector search
         pipeline = [
             {
                 '$vectorSearch': {
@@ -239,36 +275,13 @@ def store_to_redis(key, value, ttl=300):
         if r:
             r.close()
 
-# 10. Enhanced document processing
+# 10. Document processing
 async def process_document(file_id, query, user_id):
-    print(f"Processing document for query: {query}")
+    print(f"Processing query: {query}")
     
-    # Download and extract text
-    text = download_from_drive(file_id)
-    if not text:
-        return [{"text": "Failed to download or extract text from document", "similarity": 0}]
+    if not DOCUMENT_READY:
+        return [{"text": "Document not ready.", "similarity": 0}]
     
-    print(f"Extracted {len(text)} characters from document")
-    
-    # Split into chunks
-    chunks = split_text(text)
-    print(f"Split into {len(chunks)} chunks")
-    
-    # Generate embeddings
-    embeddings_chunks = []
-    for i, chunk in enumerate(chunks):
-        embedding = get_embedding(chunk)
-        if embedding:
-            embeddings_chunks.append((chunk, embedding))
-        if i + 1 == len(chunks) or (i + 1) % 10 == 0:
-            print(f"Processed {i + 1}/{len(chunks)} chunks")
-    
-    print(f"Generated {len(embeddings_chunks)} embeddings")
-    
-    # Store to MongoDB
-    store_to_mongo(embeddings_chunks)
-    
-    # Search for similar content
     query_embedding = get_embedding(query)
     if not query_embedding:
         return [{"text": "Failed to generate query embedding", "similarity": 0}]
@@ -279,12 +292,52 @@ async def process_document(file_id, query, user_id):
         for r in results if 'embedding' in r
     ]
     
-    # Sort by similarity
     similarities.sort(key=lambda x: x['similarity'], reverse=True)
     
-    # Store results in Redis
-    store_to_redis(f"chat:{user_id}", similarities)
-    return similarities
+    high_similarities = [s for s in similarities if s['similarity'] > 0.5]
+    if high_similarities:
+        store_to_redis(f"chat:{user_id}", high_similarities)
+    
+    return high_similarities
+
+# 10.1. Ollama chat function
+async def get_chat_response(query, context_chunks=None):
+    try:
+        print(f"Using chat model: {LANGUAGE_MODEL} on host: {OLLAMA_HOST}")
+        instruction_prompt = (
+            "You are a helpful assistant that answers questions based on provided document context. "
+            "Use the following context to provide accurate and concise answers. If the answer is not in the context, "
+            "state 'The document does not contain this information' and provide a general answer if possible.\n\n"
+            "Context:\n"
+        )
+        if context_chunks:
+            for i, chunk in enumerate(context_chunks, 1):
+                instruction_prompt += f"Chunk {i} (Similarity: {chunk['similarity']:.3f}):\n{chunk['text'][:500]}...\n\n"
+        else:
+            instruction_prompt += "No relevant document chunks found.\n\n"
+        
+        instruction_prompt += f"User Query: {query}"
+        
+        stream = ollama.chat(
+            model=LANGUAGE_MODEL,
+            messages=[
+                {'role': 'system', 'content': instruction_prompt},
+                {'role': 'user', 'content': query},
+            ],
+            stream=True,
+        )
+        response = ""
+        for chunk in stream:
+            if 'message' in chunk and 'content' in chunk['message']:
+                response += chunk['message']['content']
+            else:
+                print(f"Unexpected chunk structure: {chunk}")
+        if not response:
+            return "No response generated by the model."
+        return response.strip()
+    except Exception as e:
+        print(f"Ollama chat error: {type(e).__name__}: {e}")
+        return "Sorry, I couldn't generate a response. Please try again."
 
 # 11. Discord bot
 intents = discord.Intents.default()
@@ -294,39 +347,69 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
+    await initialize_document()
 
 @bot.command(name='search')
 async def search_command(ctx, *, query):
     if ctx.channel.id != DISCORD_CHANNEL:
         return
+    await ctx.send(f"Searching for: '{query}'...")
     
-    await ctx.send(f"Searching for: '{query}' - This may take a moment...")
-    
+    if not DOCUMENT_READY:
+        await ctx.send("Document not ready.")
+        return
+
     try:
         similarities = await process_document(FILE_ID, query, str(ctx.author.id))
     
-        if similarities and similarities[0]['similarity'] > 0:
+        if similarities and similarities[0]['similarity'] > 0.5:
             response = f"**Top Results for: '{query}'**\n\n"
             for i, result in enumerate(similarities[:3], 1):
                 similarity_score = result['similarity']
                 text_preview = result['text'][:500] + "..." if len(result['text']) > 500 else result['text']
                 response += f"**{i}. Match (Similarity: {similarity_score:.3f})**\n{text_preview}\n\n"
         else:
-            response = "No results found. Make sure the vector search index is configured correctly."
-            
+            response = "No results found with sufficient similarity."
+        
         if len(response) > 2000:
             response = response[:1997] + "..."
-            
+        
         await ctx.send(response)
         
     except Exception as e:
         await ctx.send(f"Error processing request: {str(e)}")
 
+@bot.command(name='chat')
+async def chat_command(ctx, *, query):
+    if ctx.channel.id != DISCORD_CHANNEL:
+        return
+    await ctx.send(f"Processing query: '{query}'...")
+    
+    if not DOCUMENT_READY:
+        await ctx.send("Document not ready.")
+        return
+
+    try:
+        # Get top matches
+        similarities = await process_document(FILE_ID, query, str(ctx.author.id))
+        
+        # Get Ollama response with context - ONLY show this response
+        ollama_response = await get_chat_response(query, similarities[:3])
+        
+        # Only send the Ollama response, no top matches displayed
+        if len(ollama_response) > 2000:
+            ollama_response = ollama_response[:1997] + "..."
+        
+        await ctx.send(ollama_response)
+        
+    except Exception as e:
+        await ctx.send(f"Error processing chat request: {str(e)}")
+
 @bot.command(name='info')
 async def info_command(ctx):
     if ctx.channel.id != DISCORD_CHANNEL:
         return
-    await ctx.send("**PDF Search Bot**\nSupports: PDF files, Google Docs, Text files\nCommands: `!search <your query>`, `!info`\nUsing 'default' vector search index with 768-dimensional embeddings")
+    await ctx.send("**PDF Search Bot**\nSupports: PDF, Google Docs, Text\nCommands: `!search <query>`, `!chat <query>`, `!info`\nUsing 768D embeddings")
 
 # Main
 if __name__ == "__main__":
