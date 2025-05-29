@@ -102,7 +102,7 @@ def extract_text_from_pdf(pdf_bytes):
         return None
 
 # 1.3. Text splitting
-def recursive_split(text, chunk_size=1000, overlap=200, splitters=["\n\n", "\n", ".", " ", ""]):
+def recursive_split(text, chunk_size=1000, overlap=0, splitters=["\n\n", "\n", ".", " ", ""]):
     def split_with_delimiter(text, delimiter):
         return text.split(delimiter) if delimiter else list(text)
 

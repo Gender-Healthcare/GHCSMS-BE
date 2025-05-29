@@ -13,6 +13,8 @@ import io
 import asyncio
 from dotenv import load_dotenv
 import fitz  # Using PyMuPDF as primary PDF library
+import time
+import requests
 
 # Load environment
 load_dotenv()
@@ -21,7 +23,7 @@ load_dotenv()
 GOOGLE_CREDS = os.getenv('GOOGLE_DRIVE_CREDENTIALS_FILE')
 FILE_ID = os.getenv('GOOGLE_DRIVE_FILE_ID')
 MONGO_URI = os.getenv('MONGO_URI')
-MONGO_DB = os.getenv('MONGO_DB', 'angler')
+MONGO_DB = os.getenv ('MONGO_DB', 'angler')
 MONGO_COLL = os.getenv('MONGO_COLLECTION', 'Vector')
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
@@ -40,6 +42,20 @@ print(f"Using Ollama host: {OLLAMA_HOST}")
 # Validate environment variables
 if not all([GOOGLE_CREDS, FILE_ID, MONGO_URI, MONGO_DB, DISCORD_TOKEN, DISCORD_CHANNEL, REDIS_HOST]):
     raise ValueError("Missing required environment variables")
+
+# Helper function to check Ollama server status
+def check_ollama_server():
+    try:
+        response = requests.get(f"http://{OLLAMA_HOST}/api/tags", timeout=5)
+        if response.status_code == 200:
+            print(f"Ollama server is running at {OLLAMA_HOST}")
+            return True
+        else:
+            print(f"Ollama server returned status {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"Failed to connect to Ollama server at {OLLAMA_HOST}: {e}")
+        return False
 
 # 1. Google Drive download
 def download_from_drive(file_id):
@@ -97,7 +113,7 @@ def extract_text_from_pdf(pdf_bytes):
         return None
 
 # 1.3. Text splitting
-def recursive_split(text, chunk_size=1000, overlap=200, splitters=["\n\n", "\n", ".", " ", ""]):
+def recursive_split(text, chunk_size=1000, overlap=0, splitters=["\n\n", "\n", ".", " ", ""]):
     def split_with_delimiter(text, delimiter):
         return text.split(delimiter) if delimiter else list(text)
 
@@ -133,22 +149,37 @@ def recursive_split(text, chunk_size=1000, overlap=200, splitters=["\n\n", "\n",
 
     return overlapped_chunks
 
-# 1.4. Generate embeddings
-def get_embedding(text):
+# 1.4. Generate embeddings with retry
+def get_embedding(text, max_retries=3, retry_delay=2):
     try:
         text = text.strip()
         if not text:
             return None
         print(f"Generating embedding with model: {MODEL}")
-        response = ollama.embeddings(model=MODEL, prompt=text)
-        embedding = response.get('embedding') or response.get('embeddings')
-        if not embedding:
-            raise ValueError(f"Model '{MODEL}' returned no embedding data")
-        if len(embedding) != 768:
-            raise ValueError(f"Embedding dimension mismatch: expected 768, got {len(embedding)}")
-        return embedding
+        
+        for attempt in range(max_retries):
+            try:
+                if not check_ollama_server():
+                    print(f"Ollama server not available, attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                response = ollama.embeddings(model=MODEL, prompt=text)
+                embedding = response.get('embedding') or response.get('embeddings')
+                if not embedding:
+                    raise ValueError(f"Model '{MODEL}' returned no embedding data")
+                if len(embedding) != 768:
+                    raise ValueError(f"Embedding dimension mismatch: expected 768, got {len(embedding)}")
+                return embedding
+            except Exception as e:
+                print(f"Embedding attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    raise
+        return None
     except Exception as e:
-        print(f"Error generating embedding: {e}")
+        print(f"Error generating embedding after {max_retries} attempts: {e}")
         return None
 
 # 1.5. Store to MongoDB
@@ -269,6 +300,7 @@ def store_to_redis(key, value, ttl=300):
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASS, decode_responses=True)
         r.setex(key, ttl, json.dumps(value))
+        print(f"Stored in Redis - Key: {key}, Value: {value}, TTL: {ttl}")
     except Exception as e:
         print(f"Error storing to Redis: {e}")
     finally:
@@ -300,14 +332,18 @@ async def process_document(file_id, query, user_id):
     
     return high_similarities
 
-# 10.1. Ollama chat function
-async def get_chat_response(query, context_chunks=None):
+# 10.1 Chat response with retry
+async def get_chat_response(query, context_chunks=None, user_id=None):
+    max_retries = 3
+    retry_delay = 2
     try:
         print(f"Using chat model: {LANGUAGE_MODEL} on host: {OLLAMA_HOST}")
         instruction_prompt = (
             "You are a helpful assistant that answers questions based on provided document context. "
             "Use the following context to provide accurate and concise answers. If the answer is not in the context, "
-            "state 'The document does not contain this information' and provide a general answer if possible.\n\n"
+            "state 'The document does not contain this information' and provide a general answer if possible."
+            "Summary the context and make a clear and concise answer (no need to mention the context) with a clear explanation or evaluation."
+            "Do not mention anything about the context or the question in your final answer.\n\n"
             "Context:\n"
         )
         if context_chunks:
@@ -318,26 +354,44 @@ async def get_chat_response(query, context_chunks=None):
         
         instruction_prompt += f"User Query: {query}"
         
-        stream = ollama.chat(
-            model=LANGUAGE_MODEL,
-            messages=[
-                {'role': 'system', 'content': instruction_prompt},
-                {'role': 'user', 'content': query},
-            ],
-            stream=True,
-        )
-        response = ""
-        for chunk in stream:
-            if 'message' in chunk and 'content' in chunk['message']:
-                response += chunk['message']['content']
-            else:
-                print(f"Unexpected chunk structure: {chunk}")
-        if not response:
-            return "No response generated by the model."
-        return response.strip()
+        for attempt in range(max_retries):
+            try:
+                if not check_ollama_server():
+                    print(f"Ollama server not available, attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                        continue
+                print(f"Sending chat request to Ollama at {OLLAMA_HOST}, attempt {attempt + 1}")
+                stream = ollama.chat(
+                    model=LANGUAGE_MODEL,
+                    messages=[
+                        {'role': 'system', 'content': instruction_prompt},
+                        {'role': 'user', 'content': query},
+                    ],
+                    stream=True,
+                )
+                response = ""
+                for chunk in stream:
+                    if 'message' in chunk and 'content' in chunk['message']:
+                        response += chunk['message']['content']
+                    else:
+                        print(f"Unexpected chunk structure: {chunk}")
+                if not response:
+                    return "No response generated by the model."
+                
+                if user_id:
+                    store_to_redis(f"chat:{user_id}", [{"text": response, "similarity": 0}])
+                
+                return response.strip()
+            except Exception as e:
+                print(f"Chat attempt {attempt + 1} failed: {type(e).__name__}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    raise
     except Exception as e:
-        print(f"Ollama chat error: {type(e).__name__}: {e}")
-        return "Sorry, I couldn't generate a response. Please try again."
+        print(f"Ollama chat error after {max_retries} attempts: {type(e).__name__}: {e}")
+        return "Sorry, I couldn't generate a response due to a server connection issue. Please try again later."
 
 # 11. Discord bot
 intents = discord.Intents.default()
@@ -347,7 +401,10 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
-    await initialize_document()
+    if check_ollama_server():
+        await initialize_document()
+    else:
+        print("Ollama server not available, skipping document initialization.")
 
 @bot.command(name='search')
 async def search_command(ctx, *, query):
@@ -394,7 +451,7 @@ async def chat_command(ctx, *, query):
         similarities = await process_document(FILE_ID, query, str(ctx.author.id))
         
         # Get Ollama response with context - ONLY show this response
-        ollama_response = await get_chat_response(query, similarities[:3])
+        ollama_response = await get_chat_response(query, similarities[:3], str(ctx.author.id))
         
         # Only send the Ollama response, no top matches displayed
         if len(ollama_response) > 2000:
@@ -410,6 +467,18 @@ async def info_command(ctx):
     if ctx.channel.id != DISCORD_CHANNEL:
         return
     await ctx.send("**PDF Search Bot**\nSupports: PDF, Google Docs, Text\nCommands: `!search <query>`, `!chat <query>`, `!info`\nUsing 768D embeddings")
+
+@bot.command(name='stop')
+async def stop_command(ctx):
+    if ctx.channel.id != DISCORD_CHANNEL:
+        return
+    
+    await ctx.send("Shutting down the bot...")
+    try:
+        await bot.close()
+        print(f"Bot stopped by {ctx.author.name}#{ctx.author.discriminator}")
+    except Exception as e:
+        await ctx.send(f"Error stopping the bot: {str(e)}")
 
 # Main
 if __name__ == "__main__":
